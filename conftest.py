@@ -51,9 +51,7 @@ def _resolve_asyncio_marker(item: pytest.Function) -> pytest.Mark | None:
     marker = item.get_closest_marker("asyncio")
     if marker is not None:
         return marker
-    if Mode.from_config(item.config) == Mode.AUTO:
-        item.add_marker("asyncio")
-        return item.get_closest_marker("asyncio")
+    breakpoint()
     return None
 
 
