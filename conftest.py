@@ -9,6 +9,7 @@ import enum
 from typing import Any, Self
 
 import pytest
+from pytest import ScopeName, StashKey
 
 
 # --- public API -------------------------------------------------------
@@ -86,16 +87,97 @@ def _set_event_loop(loop: AbstractEventLoop | None) -> None:
         asyncio.set_event_loop(loop)
 
 
-@contextlib.contextmanager
-def _scoped_runner(
-    _asyncio_loop_factory,
-) -> Iterator[Runner]:
-    runner = Runner(
-        loop_factory=_asyncio_loop_factory,
-    )
-    with runner:
-        yield runner
+class _EventLoopManager:
+    def __init__(self):
+        self._runner_by_scope: dict[ScopeName, Runner] = {}
 
+    @contextlib.contextmanager
+    def _scoped_runner(
+        self,
+        scope: ScopeName,
+        _asyncio_loop_factory,
+    ) -> Iterator[Runner]:
+        runner = Runner(
+            loop_factory=_asyncio_loop_factory,
+        )
+        with runner:
+            yield runner
+
+    def setup_loop(self, item: pytest.Item, nextitem: pytest.Item | None):
+        current_scope = _get_scope(item)
+        runner = self._runner_by_scope.get(current_scope)
+        if runner is None:
+            runner = asyncio.Runner()
+            print(f"Created runner for scope {current_scope=}")
+            self._runner_by_scope[current_scope] = runner
+
+    def teardown_loop(self, item: pytest.Item, nextitem: pytest.Item | None):
+        if nextitem is None:
+            for scope, runner in reversed(self._runner_by_scope.items()):
+                print(f"Destroyed runner for scope {scope=}")
+                runner.close()
+            self._runner_by_scope.clear()
+            return
+        current_scope = _get_scope(item)
+        match current_scope:
+            case 'function':
+                self._runner_by_scope.pop(current_scope).close()
+                print(f"Destroyed runner for scope {current_scope=}")
+            case 'class':
+                if nextitem.cls is not item.cls:
+                    self._runner_by_scope.pop(current_scope).close()
+                    print(f"Destroyed runner for scope {current_scope=}")
+            case 'module':
+                if nextitem.module is not item.module:
+                    self._runner_by_scope.pop(current_scope).close()
+                    print(f"Destroyed runner for scope {current_scope=}")
+            case 'package':
+                raise NotImplementedError()
+            case 'session':
+                if nextitem is None:
+                    self._runner_by_scope.pop(current_scope).close()
+                    print(f"Destroyed runner for scope {current_scope=}")
+
+    def get_runner(self, scope: ScopeName) -> Runner:
+        return self._runner_by_scope[scope]
+                
+    def shutdown(self):
+        # assert not self._runner_by_scope
+        pass
+
+
+_event_loop_manager_stash_key = StashKey[_EventLoopManager]()
+
+def pytest_configure(config: pytest.Config):
+    config.stash[_event_loop_manager_stash_key] = _EventLoopManager()
+    
+def pytest_unconfigure(config: pytest.Config):
+    loop_manager = config.stash[_event_loop_manager_stash_key]
+    loop_manager.shutdown()
+    del config.stash[_event_loop_manager_stash_key]
+
+
+_runner: asyncio.Runner | None = None
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item, nextitem: pytest.Item | None):
+    testfunction = item.obj
+
+    from _pytest.compat import is_async_function
+
+    if not is_async_function(testfunction):
+        yield
+        return
+
+    marker = _resolve_asyncio_marker(item)
+    if not marker:
+        yield
+        return
+    loop_manager: _EventLoopManager = item.config.stash[_event_loop_manager_stash_key]
+    loop_manager.setup_loop(item, nextitem)
+    yield
+    loop_manager.teardown_loop(item, nextitem)
+    
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> object | None:
@@ -108,6 +190,14 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> object | None:
 
     funcargs = pyfuncitem.funcargs
     testargs = {arg: funcargs[arg] for arg in pyfuncitem._fixtureinfo.argnames}
-    with _scoped_runner(_asyncio_loop_factory=asyncio.new_event_loop) as runner:
-        result = runner.run(testfunction(**testargs))
+    loop_manager: _EventLoopManager = pyfuncitem.config.stash[_event_loop_manager_stash_key]
+    scope = _get_scope(pyfuncitem)
+    runner = loop_manager.get_runner(scope)
+    runner.run(testfunction(**testargs))
     return True
+
+def _get_scope(item: pytest.Item) -> ScopeName:
+    marker = _resolve_asyncio_marker(item)
+    assert marker
+    return marker.kwargs.get("loop_scope", "function")
+    
